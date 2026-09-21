@@ -4391,8 +4391,12 @@ static quicly_error_t send_control_frames_of_stream(quicly_stream_t *stream, qui
     }
 
     /* Send RESET_STREAM or RESET_STREAM_AT if necessary. Note that the Final Size being sent is `size_inflight`; it never grows
-     * once the stream has been reset, as the bytes being retained for delivery are all below that offset. */
-    if (stream->_send_aux.reset_stream.sender_state == QUICLY_SENDER_STATE_SEND) {
+     * once the stream has been reset, as the bytes being retained for delivery are all below that offset. The frame is withheld
+     * until the bytes below the Reliable Size have been sent, at which point the Final Size being declared is exactly the amount of
+     * flow control credit that has already been consumed; that is how the frame is kept within the limits advertised by the peer
+     * (draft-ietf-quic-reliable-stream-reset, section 4). `quicly_send_stream` reschedules the stream once that happens. */
+    if (stream->_send_aux.reset_stream.sender_state == QUICLY_SENDER_STATE_SEND &&
+        stream->sendstate.size_inflight >= stream->_send_aux.reset_stream.reliable_size) {
         uint64_t reliable_size = stream->_send_aux.reset_stream.reliable_size;
         if (reliable_size == 0) {
             if ((ret = prepare_stream_state_sender(stream, &stream->_send_aux.reset_stream.sender_state, s,
@@ -4647,8 +4651,11 @@ quicly_error_t quicly_send_stream(quicly_stream_t *stream, quicly_send_context_t
 
     adjust_stream_frame_layout(&dst, s->dst_end, &len, &wrote_all, &s->dst);
 
-    /* determine if the frame incorporates FIN */
-    if (off + len == stream->sendstate.final_size) {
+    /* Determine if the frame incorporates FIN. A stream that has been reset never uses the FIN bit, as it is the RESET_STREAM_AT
+     * frame that conveys the final size (draft-ietf-quic-reliable-stream-reset, section 5.3); were the FIN bit used here, it would
+     * declare a final size of `reliable_size` while the frame declares `size_inflight`, and a FIN arriving first would complete the
+     * stream and thereby keep the peer from reporting the error code to its application. */
+    if (off + len == stream->sendstate.final_size && stream->_send_aux.reset_stream.sender_state == QUICLY_SENDER_STATE_NONE) {
         assert(!quicly_sendstate_is_open(&stream->sendstate));
         assert(s->dst != NULL);
         is_fin = 1;
@@ -4685,6 +4692,10 @@ UpdateState:
         if (stream->stream_id >= 0)
             stream->conn->egress.max_data.sent += off + len - stream->sendstate.size_inflight;
         stream->sendstate.size_inflight = off + len;
+        /* a RESET_STREAM_AT frame being withheld until the bytes below the Reliable Size are sent can now be sent */
+        if (stream->_send_aux.reset_stream.sender_state == QUICLY_SENDER_STATE_SEND &&
+            stream->sendstate.size_inflight >= stream->_send_aux.reset_stream.reliable_size)
+            sched_stream_control(stream);
     }
     if ((ret = quicly_ranges_subtract(&stream->sendstate.pending, off, off + len + is_fin)) != 0)
         return ret;
@@ -6327,6 +6338,10 @@ static quicly_error_t handle_reset_of_stream(quicly_conn_t *conn, uint64_t strea
     if ((ret = quicly_recvstate_reset_at(&stream->recvstate, final_size, reliable_size, &bytes_missing)) != 0)
         return ret;
     stream->recvstate.app_error_code = app_error_code;
+    /* the final size is subject to connection-level flow control as well as to the stream-level limit checked above (section 4 of
+     * draft-ietf-quic-reliable-stream-reset, section 4.5 of RFC 9000) */
+    if (conn->ingress.max_data.bytes_consumed + bytes_missing > conn->ingress.max_data.sender.max_committed)
+        return QUICLY_TRANSPORT_ERROR_FLOW_CONTROL;
     conn->ingress.max_data.bytes_consumed += bytes_missing;
 
     /* Notify the application once, when the stream is reset for the first time. Subsequent frames can only reduce the reliable
@@ -6618,7 +6633,9 @@ static quicly_error_t handle_max_stream_data_frame(quicly_conn_t *conn, struct s
     stream->_send_aux.max_stream_data = frame.max_stream_data;
     stream->_send_aux.blocked = QUICLY_SENDER_STATE_NONE;
 
-    if (stream->_send_aux.reset_stream.sender_state == QUICLY_SENDER_STATE_NONE)
+    /* Note that a stream that has been reset can be blocked at stream level too, as the Reliable Size may cover bytes that have not
+     * been sent yet (draft-ietf-quic-reliable-stream-reset, section 5.3). */
+    if (stream_data_is_sendable(stream))
         resched_stream_data(stream);
 
     return 0;
@@ -8029,13 +8046,13 @@ void quicly_reset_stream_at(quicly_stream_t *stream, quicly_error_t err, uint64_
     assert(quicly_stream_has_send_side(quicly_is_client(stream->conn), stream->stream_id));
     assert(QUICLY_ERROR_IS_QUIC_APPLICATION(err));
 
-    /* Cap the Reliable Size to what can be delivered by sending a RESET_STREAM_AT frame: the peer has to be willing to receive the
-     * frame, and the bytes have to be within `size_inflight`, which is the Final Size being declared and hence the amount of flow
-     * control credit that has already been consumed (draft-ietf-quic-reliable-stream-reset, section 4). */
+    /* The peer has to be willing to receive the frame, and we cannot commit to delivering more than the final size that the peer
+     * might already know (draft-ietf-quic-reliable-stream-reset, section 5.2). Bytes that have not been sent yet can be committed
+     * to; `send_control_frames_of_stream` withholds the frame until they are on the wire. */
     if (!stream->conn->super.remote.transport_params.reset_stream_at)
         reliable_size = 0;
-    if (reliable_size > stream->sendstate.size_inflight)
-        reliable_size = stream->sendstate.size_inflight;
+    if (!quicly_sendstate_is_open(&stream->sendstate) && reliable_size > stream->sendstate.final_size)
+        reliable_size = stream->sendstate.final_size;
 
     if (stream->_send_aux.reset_stream.sender_state == QUICLY_SENDER_STATE_NONE) {
         assert(!quicly_sendstate_transfer_complete(&stream->sendstate));
