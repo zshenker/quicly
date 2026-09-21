@@ -238,7 +238,7 @@ static void test_reset_stream_at_truncated(void)
     }
 }
 
-static void test_reset_stream_at(void)
+static void test_reset_stream_at_codec(void)
 {
     uint8_t buf[QUICLY_RST_AT_FRAME_CAPACITY], *end;
     const uint8_t *src;
@@ -272,6 +272,6 @@ void test_frame(void)
 {
     subtest("ack-decode", test_ack_decode);
     subtest("ack-encode", test_ack_encode);
-    subtest("reset-stream-at", test_reset_stream_at);
+    subtest("reset-stream-at", test_reset_stream_at_codec);
     subtest("mozquic", test_mozquic);
 }
