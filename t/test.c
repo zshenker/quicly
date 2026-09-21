@@ -1571,6 +1571,7 @@ int main(int argc, char **argv)
     subtest("address-token-codec", test_address_token_codec);
     subtest("ranges", test_ranges);
     subtest("rate", test_rate);
+    subtest("recvstate", test_recvstate);
     subtest("record-receipt", test_record_receipt);
     subtest("is-duplicate-pn", test_is_duplicate_pn);
     subtest("frame", test_frame);
