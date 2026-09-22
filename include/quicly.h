@@ -599,7 +599,7 @@ struct st_quicly_conn_streamgroup_state_t {
         uint64_t padding, ping, ack, reset_stream, stop_sending, crypto, new_token, stream, max_data, max_stream_data,             \
             max_streams_bidi, max_streams_uni, data_blocked, stream_data_blocked, streams_blocked, new_connection_id,              \
             retire_connection_id, path_challenge, path_response, transport_close, application_close, handshake_done, datagram,     \
-            ack_frequency, immediate_ack;                                                                                          \
+            ack_frequency, immediate_ack, reset_stream_at;                                                                         \
     } num_frames_received, num_frames_sent;                                                                                        \
     struct {                                                                                                                       \
         /**                                                                                                                        \
@@ -793,7 +793,8 @@ typedef struct st_quicly_stats_t {
     QUICLY_STATS__DO_FOREACH_NUM_FRAMES(handshake_done, dir, apply)                                                                \
     QUICLY_STATS__DO_FOREACH_NUM_FRAMES(datagram, dir, apply)                                                                      \
     QUICLY_STATS__DO_FOREACH_NUM_FRAMES(ack_frequency, dir, apply)                                                                 \
-    QUICLY_STATS__DO_FOREACH_NUM_FRAMES(immediate_ack, dir, apply)
+    QUICLY_STATS__DO_FOREACH_NUM_FRAMES(immediate_ack, dir, apply)                                                                 \
+    QUICLY_STATS__DO_FOREACH_NUM_FRAMES(reset_stream_at, dir, apply)
 
 #define QUICLY_STATS_FOREACH_TRANSPORT_COUNTERS(apply)                                                                             \
     apply(num_paths.created, "num-paths.created")                                                                                  \
@@ -979,7 +980,13 @@ typedef struct st_quicly_stream_callbacks_t {
      */
     void (*on_receive)(quicly_stream_t *stream, size_t off, const void *src, size_t len);
     /**
-     * called when a RESET_STREAM frame is received
+     * called when a RESET_STREAM or a RESET_STREAM_AT frame is received. In case of the latter, the callback can be followed by
+     * further `on_receive` calls, as the peer remains committed to delivering the bytes below `quicly_stream_t::recvstate`'s
+     * `reliable_size`; applications wanting those bytes are to keep reading until the transfer completes. Applications not wanting
+     * them can discard the receive side as a whole, returning the flow control credit through `quicly_conn_sync_recvbuf`, but the
+     * `on_receive` calls still occur until the stream is destroyed. The callback is invoked only once for each stream, even if
+     * subsequent frames reduce `reliable_size`. This can only happen when the application has advertised the reset_stream_at
+     * transport parameter.
      */
     void (*on_receive_reset)(quicly_stream_t *stream, quicly_error_t err);
 } quicly_stream_callbacks_t;
@@ -1037,6 +1044,12 @@ struct st_quicly_stream_t {
              */
             quicly_sender_state_t sender_state;
             uint64_t error_code;
+            /**
+             * Amount of data that is delivered even though the stream is being reset. Zero indicates that a RESET_STREAM frame is
+             * to be sent; otherwise, a RESET_STREAM_AT frame carrying this value as the Reliable Size is sent. Once set, this value
+             * can only be reduced.
+             */
+            uint64_t reliable_size;
         } reset_stream;
         /**
          * sends receive window updates to remote peer
@@ -1485,6 +1498,16 @@ quicly_error_t quicly_get_or_open_stream(quicly_conn_t *conn, uint64_t stream_id
  */
 void quicly_reset_stream(quicly_stream_t *stream, quicly_error_t err);
 /**
+ * Resets the stream, requesting the peer to deliver the first `reliable_size` bytes to the application even though the stream is
+ * being reset; see draft-ietf-quic-reliable-stream-reset. `reliable_size` is capped to the amount of data that has already been
+ * sent at least once, as well as to the value supplied by the preceding call (the Reliable Size can only be reduced). If the peer
+ * has not advertised the willingness to receive RESET_STREAM_AT frames, `reliable_size` is ignored and a RESET_STREAM frame is sent
+ * instead; applications cannot know the transport parameters of the peer at the moment they reset a stream. Calling this function
+ * with `reliable_size` being zero is identical to calling `quicly_reset_stream`. When called for the second time, the error code of
+ * the first call is retained, as required by the draft.
+ */
+void quicly_reset_stream_at(quicly_stream_t *stream, quicly_error_t err, uint64_t reliable_size);
+/**
  *
  */
 void quicly_request_stop(quicly_stream_t *stream, quicly_error_t err);
@@ -1500,6 +1523,18 @@ int quicly_stream_sync_sendbuf(quicly_stream_t *stream, int activate);
  *
  */
 void quicly_stream_sync_recvbuf(quicly_stream_t *stream, size_t shift_amount);
+/**
+ * Returns connection-level flow control credit for `shift_amount` bytes that the application has consumed or discarded, without
+ * touching any stream. This is for bytes that can no longer be returned through `quicly_stream_sync_recvbuf`, being:
+ * - input that the application retains after the stream has received all of its data and has been destroyed, or
+ * - the receive side of a stream reset by RESET_STREAM_AT being discarded as a whole, before all the bytes below the Reliable Size
+ *   have arrived. In this case the application returns `recvstate.eos - recvstate.data_off` at once without advancing
+ *   `recvstate.data_off` across the missing bytes, which quicly continues to receive. The application MUST NOT return credit for
+ *   that stream again, including for bytes delivered by the `on_receive` callbacks that follow.
+ * `shift_amount` MUST NOT include bytes that have already been returned through either function. The stream-level limit and the
+ * amount received are not changed, and no callbacks are invoked.
+ */
+void quicly_conn_sync_recvbuf(quicly_conn_t *conn, size_t shift_amount);
 /**
  *
  */

@@ -483,6 +483,24 @@ static void test_transport_parameters(void)
     ok(quicly_decode_transport_parameter_list(&decoded, NULL, NULL, NULL, NULL, reset_stream_at_nonempty_bytes,
                                               reset_stream_at_nonempty_bytes + sizeof(reset_stream_at_nonempty_bytes)) ==
        QUICLY_TRANSPORT_ERROR_TRANSPORT_PARAMETER);
+
+    /* reset_stream_at is bound into the session ticket auth data, so that toggling it refuses 0-RTT */
+    {
+        quicly_context_t ctx = quic_ctx;
+        ptls_buffer_t without, with;
+
+        ctx.transport_params.reset_stream_at = 0;
+        ptls_buffer_init(&without, "", 0);
+        ok(quicly_build_session_ticket_auth_data(&without, &ctx) == 0);
+
+        ctx.transport_params.reset_stream_at = 1;
+        ptls_buffer_init(&with, "", 0);
+        ok(quicly_build_session_ticket_auth_data(&with, &ctx) == 0);
+
+        ok(without.off != with.off || memcmp(without.base, with.base, without.off) != 0);
+        ptls_buffer_dispose(&without);
+        ptls_buffer_dispose(&with);
+    }
 }
 
 size_t decode_packets(quicly_decoded_packet_t *decoded, struct iovec *raw, size_t cnt)
@@ -1302,6 +1320,92 @@ static void test_setup_connected_peers(quicly_conn_t **client, quicly_conn_t **s
     exchange_until_idle(*client, *server);
 }
 
+/**
+ * This test checks that `quicly_conn_sync_recvbuf` returns connection-level credit for input that the application retains after the
+ * stream has been destroyed. Sixteen streams are sent one after another, carrying eight times the initial connection-level window;
+ * the transfer would stall if the credit were not returned.
+ */
+static void test_conn_sync_recvbuf(void)
+{
+    quicly_transport_parameters_t orig_params = quic_ctx.transport_params;
+    quic_ctx.transport_params.max_data = 512;
+    quic_ctx.transport_params.max_stream_data.uni = 512;
+    quic_ctx.transport_params.max_streams_uni = 1;
+
+    quicly_conn_t *client, *server;
+    uint8_t payload[256];
+    uint64_t consumed, shifted, permitted, sent;
+
+    test_setup_connected_peers(&client, &server);
+    memset(payload, 0x5a, sizeof(payload));
+
+    for (size_t i = 0; i != 16; ++i) {
+        quicly_stream_t *client_stream, *server_stream;
+        test_streambuf_t *client_streambuf, *server_streambuf;
+        quicly_stream_id_t stream_id;
+
+        ok(quicly_open_stream(client, &client_stream, 1) == 0);
+        stream_id = client_stream->stream_id;
+        client_streambuf = client_stream->data;
+        ok(quicly_streambuf_egress_write(client_stream, payload, sizeof(payload)) == 0);
+        transmit(client, server);
+        server_stream = quicly_get_stream(server, stream_id);
+        ok(server_stream != NULL);
+        server_streambuf = server_stream->data;
+        ok(quicly_streambuf_ingress_get(server_stream).len == sizeof(payload));
+        quicly_streambuf_ingress_shift(server_stream, 7); /* some of the credit is returned while the stream is alive */
+        ok(quicly_streambuf_egress_shutdown(client_stream) == 0);
+
+        /* the stream is destroyed once the FIN is received, while the application retains the rest of the input */
+        for (size_t round = 0; round != 32; ++round) {
+            transmit(client, server);
+            transmit(server, client);
+            quic_now += 10;
+            if (quicly_get_stream(server, stream_id) == NULL && quicly_get_stream(client, stream_id) == NULL)
+                break;
+        }
+        ok(quicly_get_stream(server, stream_id) == NULL && quicly_get_stream(client, stream_id) == NULL);
+        ok(client_streambuf->is_detached && server_streambuf->is_detached);
+        ok(server_streambuf->super.ingress.off == sizeof(payload) - 7);
+        ok(memcmp(server_streambuf->super.ingress.base, payload + 7, sizeof(payload) - 7) == 0);
+
+        /* destruction did not return the credit for the retained input */
+        quicly_get_max_data(server, NULL, NULL, &consumed, &shifted);
+        ok(consumed == (i + 1) * sizeof(payload));
+        ok(shifted == i * sizeof(payload) + 7);
+
+        /* the application returns it in pieces as it consumes the retained input */
+        quicly_conn_sync_recvbuf(server, 0);
+        quicly_conn_sync_recvbuf(server, 83);
+        quicly_get_max_data(server, NULL, NULL, NULL, &shifted);
+        ok(shifted == i * sizeof(payload) + 90);
+        quicly_conn_sync_recvbuf(server, sizeof(payload) - 90);
+        quicly_get_max_data(server, NULL, NULL, NULL, &shifted);
+        ok(shifted == consumed);
+
+        /* deliver the MAX_DATA frame being scheduled */
+        transmit(server, client);
+        transmit(client, server);
+        quic_now += 10;
+
+        quicly_sendbuf_dispose(&client_streambuf->super.egress);
+        ptls_buffer_dispose(&client_streambuf->super.ingress);
+        free(client_streambuf);
+        quicly_sendbuf_dispose(&server_streambuf->super.egress);
+        ptls_buffer_dispose(&server_streambuf->super.ingress);
+        free(server_streambuf);
+    }
+
+    quicly_get_max_data(client, &permitted, &sent, NULL, NULL);
+    ok(sent == 16 * sizeof(payload));
+    ok(permitted > quic_ctx.transport_params.max_data);
+
+    quicly_free(client);
+    quicly_free(server);
+
+    quic_ctx.transport_params = orig_params;
+}
+
 static void test_setup_send_context(quicly_conn_t *conn, quicly_send_context_t *s, struct iovec *datagram, void *buf,
                                     size_t bufsize)
 {
@@ -1631,10 +1735,12 @@ int main(int argc, char **argv)
     subtest("address-token-codec", test_address_token_codec);
     subtest("ranges", test_ranges);
     subtest("rate", test_rate);
+    subtest("recvstate", test_recvstate);
     subtest("record-receipt", test_record_receipt);
     subtest("is-duplicate-pn", test_is_duplicate_pn);
     subtest("frame", test_frame);
     subtest("maxsender", test_maxsender);
+    subtest("sendstate", test_sendstate);
     subtest("pacer", test_pacer);
     subtest("sentmap", test_sentmap);
     subtest("loss", test_loss);
@@ -1645,6 +1751,8 @@ int main(int argc, char **argv)
     subtest("cid", test_cid);
     subtest("simple", test_simple);
     subtest("stream-concurrency", test_stream_concurrency);
+    subtest("conn-sync-recvbuf", test_conn_sync_recvbuf);
+    subtest("reset-stream-at", test_reset_stream_at);
     subtest("lossy", test_lossy);
     subtest("test-nondecryptable-initial", test_nondecryptable_initial);
     subtest("set_cc", test_set_cc);
